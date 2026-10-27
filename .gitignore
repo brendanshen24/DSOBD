@@ -1,0 +1,20 @@
+# Build output (every app)
+build/
+*.o
+*.d
+*.elf
+*.map
+*.lst
+*.nds
+*.3dsx
+*.cia
+*.smdh
+*.prx
+EBOOT.PBP
+PARAM.SFO
+
+# macOS
+.DS_Store
+
+# Reference media for the gauge UI (~60 MB of frames and videos, kept locally)
+turboxs-dtec/reference_images/

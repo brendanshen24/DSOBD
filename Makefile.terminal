@@ -1,0 +1,15 @@
+export BLOCKSDS ?= /Users/brendan/DSCarplay/tools/sysroot/thirdparty/blocksds/core
+export WONDERFUL_TOOLCHAIN ?= /Users/brendan/DSCarplay/tools/sysroot
+
+NAME := dsobd_terminal
+GAME_TITLE := DSOBD Terminal
+GAME_SUBTITLE := Nintendo DS OBD-II Terminal
+GAME_AUTHOR := DSOBD
+
+ARM7ELF := $(BLOCKSDS)/sys/arm7/main_core/arm7_dswifi.elf
+LIBS := -ldswifi9 -lnds9 -lm
+LIBDIRS := $(BLOCKSDS)/libs/dswifi $(BLOCKSDS)/libs/libnds
+INCLUDEDIRS := include $(BLOCKSDS)/libs/dswifi/include $(BLOCKSDS)/libs/libnds/include core/include
+SOURCEDIRS := source core/source
+
+include $(BLOCKSDS)/sys/default_makefiles/rom_arm9/Makefile
