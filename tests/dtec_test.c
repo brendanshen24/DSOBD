@@ -73,6 +73,10 @@ void gfx_draw_str(uint16_t *b, int x, int y, const char *s, uint16_t c, int scal
 void gfx_draw_str_clipped(uint16_t *b, int x, int y, int w, const char *s, uint16_t c, int scale) {
     (void)w; gfx_draw_str(b,x,y,s,c,scale);
 }
+int gfx_text_width(const char *s, int scale) { return (int)strlen(s) * 6 * scale; }
+void gfx_draw_str_align(uint16_t *b, int x, int y, int a, const char *s, uint16_t c, int scale) {
+    gfx_draw_str(b, x - gfx_text_width(s, scale) * a / 2, y, s, c, scale);
+}
 void gfx_seg_number(uint16_t *b, int x, int y, int w, int h, int t, int d, int val, uint16_t on, uint16_t off, int skew) {
     (void)w; (void)h; (void)t; (void)d; (void)off; (void)skew;
     char s[16]; if (val < 0) snprintf(s, sizeof(s), "---"); else snprintf(s, sizeof(s), "%d", val);
@@ -80,6 +84,10 @@ void gfx_seg_number(uint16_t *b, int x, int y, int w, int h, int t, int d, int v
 }
 static bool contains(const char *s) {
     for (int i = 0; i < label_count; i++) if (strstr(labels[i], s)) return true;
+    return false;
+}
+static bool has_label(const char *s) {
+    for (int i = 0; i < label_count; i++) if (!strcmp(labels[i], s)) return true;
     return false;
 }
 static void rx(const char *s) { dtec_obd_feed_rx((const uint8_t *)s, strlen(s)); }
@@ -218,7 +226,7 @@ static void test_codes(void) {
     g_dtec.screen_mode = DTEC_MODE_ECU_INFO; dtec_render_top(&dummy);
     assert(contains("ECU ECM-EngineControl")); assert(contains("CAL 37805RBBA530"));
     assert(contains("OBD OBD-II CARB")); assert(contains("GASOLINE")); assert(contains("ODOMETER 123457km"));
-    assert(contains("C3     14     6")); assert(!contains("C1 "));
+    assert(has_label("C3")); assert(has_label("14")); assert(has_label("6")); assert(!has_label("C1"));
     int n = sent_count; dtec_handle_touch(20, 40, true); assert(g_dtec.scanning);
     scan_reply("ATDP", NULL); assert(sent_count == n + 1);
 

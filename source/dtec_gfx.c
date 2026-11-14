@@ -12,8 +12,25 @@ static uint16_t blend(uint16_t bg, uint16_t fg, unsigned alpha) {
         ((((bg >> 10) & 31) * inv) + (((fg >> 10) & 31) * alpha)) / 15);
 }
 
+// Brushed instrument deck: a subtle vertical gradient with a diagonal grain.
+// Computed once instead of embedded, keeping the ARM9 binary small.
+static uint16_t s_deck[SCREEN_W * SCREEN_H];
+static bool s_deck_ready;
+
 void gfx_background(uint16_t *buf) {
-    if (buf) memcpy(buf, dtec_art_deck, SCREEN_W * SCREEN_H * sizeof(uint16_t));
+    if (!buf) return;
+    if (!s_deck_ready) {
+        for (int y = 0; y < SCREEN_H; y++) {
+            int k = SCREEN_H - y;
+            for (int x = 0; x < SCREEN_W; x++) {
+                int r = 8 + 7 * k / SCREEN_H + ((x + y) % 4 == 0);
+                int g = 13 + 8 * k / SCREEN_H, b = 20 + 12 * k / SCREEN_H;
+                s_deck[y * SCREEN_W + x] = (uint16_t)(0x8000 | (r >> 3) | ((g >> 3) << 5) | ((b >> 3) << 10));
+            }
+        }
+        s_deck_ready = true;
+    }
+    memcpy(buf, s_deck, sizeof(s_deck));
 }
 
 void gfx_dial(uint16_t *buf, int cx, int cy, int radius) {
@@ -156,16 +173,27 @@ void gfx_circle_fill(uint16_t *buf, int cx, int cy, int radius, uint16_t color) 
     }
 }
 
+static int glyph_adv(char c, int scale) {
+    if (c < 32 || c > 126 || scale < 1 || scale > 3) return 0;
+    return dtec_font_adv[(scale - 1) * 95 + (c - 32)];
+}
+
+int gfx_text_width(const char *str, int scale) {
+    int w = 0;
+    while (str && *str && *str != '\n') w += glyph_adv(*str++, scale);
+    return w;
+}
+
 void gfx_draw_char(uint16_t *buf, int x, int y, char c, uint16_t color, int scale) {
     if (!buf || c < 32 || c > 126 || scale < 1 || scale > 3) return;
-    int size = 8 * scale;
+    int cw = 10 * scale, ch = 8 * scale;
     const uint8_t *font = scale == 1 ? dtec_font_1 : (scale == 2 ? dtec_font_2 : dtec_font_3);
-    const uint8_t *glyph = font + (c - 32) * size * size;
-    for (int row = 0; row < size; row++) {
+    const uint8_t *glyph = font + (c - 32) * cw * ch;
+    for (int row = 0; row < ch; row++) {
         if ((unsigned)(y + row) >= SCREEN_H) continue;
-        for (int col = 0; col < size; col++) {
+        for (int col = 0; col < cw; col++) {
             if ((unsigned)(x + col) >= SCREEN_W) continue;
-            unsigned alpha = glyph[row * size + col];
+            unsigned alpha = glyph[row * cw + col];
             if (!alpha) continue;
             uint16_t *pixel = &buf[(y + row) * SCREEN_W + x + col];
             *pixel = alpha == 15 ? color : blend(*pixel, color, alpha);
@@ -176,33 +204,25 @@ void gfx_draw_char(uint16_t *buf, int x, int y, char c, uint16_t color, int scal
 void gfx_draw_str(uint16_t *buf, int x, int y, const char *str, uint16_t color, int scale) {
     if (!buf || !str) return;
     int cur_x = x;
-    int char_w = 8 * scale;
-    while (*str) {
-        if (*str == '\n') {
-            y += 9 * scale;
-            cur_x = x;
-        } else {
-            if (cur_x + char_w <= SCREEN_W) {
-                gfx_draw_char(buf, cur_x, y, *str, color, scale);
-            }
-            cur_x += char_w;
-        }
-        str++;
+    for (; *str; str++) {
+        if (*str == '\n') { y += 9 * scale; cur_x = x; continue; }
+        gfx_draw_char(buf, cur_x, y, *str, color, scale);
+        cur_x += glyph_adv(*str, scale);
     }
+}
+
+void gfx_draw_str_align(uint16_t *buf, int x, int y, int align, const char *str, uint16_t color, int scale) {
+    gfx_draw_str(buf, x - gfx_text_width(str, scale) * align / 2, y, str, color, scale);
 }
 
 void gfx_draw_str_clipped(uint16_t *buf, int x, int y, int max_w, const char *str, uint16_t color, int scale) {
     if (!buf || !str) return;
     int cur_x = x;
-    int char_w = 8 * scale;
     int right_limit = (max_w > 0) ? (x + max_w) : SCREEN_W;
     if (right_limit > SCREEN_W) right_limit = SCREEN_W;
-
-    while (*str && cur_x + char_w <= right_limit) {
-        if (*str == '\n') break;
+    while (*str && *str != '\n' && cur_x + glyph_adv(*str, scale) <= right_limit) {
         gfx_draw_char(buf, cur_x, y, *str, color, scale);
-        cur_x += char_w;
-        str++;
+        cur_x += glyph_adv(*str++, scale);
     }
 }
 
@@ -210,46 +230,25 @@ void gfx_draw_str_wrap(uint16_t *buf, int x, int y, int max_w, const char *str, 
     if (!buf || !str || max_w <= 0) return;
     int cur_x = x;
     int cur_y = y;
-    int char_w = 8 * scale;
     int line_h = 9 * scale;
     int right_limit = x + max_w;
     if (right_limit > SCREEN_W) right_limit = SCREEN_W;
 
     while (*str) {
-        if (*str == '\n') {
-            cur_x = x;
-            cur_y += line_h;
-            str++;
-            continue;
-        }
-
-        if (*str == ' ') {
-            cur_x += char_w;
-            str++;
-            continue;
-        }
+        if (*str == '\n') { cur_x = x; cur_y += line_h; str++; continue; }
+        if (*str == ' ') { cur_x += glyph_adv(' ', scale); str++; continue; }
 
         const char *word_end = str;
-        while (*word_end && *word_end != ' ' && *word_end != '\n') {
-            word_end++;
-        }
-        int word_chars = (int)(word_end - str);
-        int word_pixels = word_chars * char_w;
+        int word_pixels = 0;
+        while (*word_end && *word_end != ' ' && *word_end != '\n') word_pixels += glyph_adv(*word_end++, scale);
 
-        if (cur_x > x && cur_x + word_pixels > right_limit) {
-            cur_x = x;
-            cur_y += line_h;
-        }
-
+        if (cur_x > x && cur_x + word_pixels > right_limit) { cur_x = x; cur_y += line_h; }
         if (cur_y + 8 * scale > SCREEN_H) break;
 
-        for (int i = 0; i < word_chars; i++) {
-            if (cur_x + char_w <= right_limit) {
-                gfx_draw_char(buf, cur_x, cur_y, str[i], color, scale);
-            }
-            cur_x += char_w;
+        for (; str < word_end; str++) {
+            if (cur_x + glyph_adv(*str, scale) <= right_limit) gfx_draw_char(buf, cur_x, cur_y, *str, color, scale);
+            cur_x += glyph_adv(*str, scale);
         }
-        str = word_end;
     }
 }
 

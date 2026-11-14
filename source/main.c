@@ -52,8 +52,15 @@ static void boot_mark(uint16_t *top, uint16_t *bottom, uint16_t color, int stage
     // ~1 s by polling the scanline counter: must not depend on IRQs, which may be what is broken.
     for (int i = 0; i < BOOT_TRACE_FRAMES; i++) { while (REG_VCOUNT != 192); while (REG_VCOUNT == 192); }
 }
+// Earliest possible sign of life, before any libnds video setup: magenta backdrop.
+static void boot_mark0(void) {
+    REG_DISPCNT = MODE_0_2D;            // display on, no layers: the backdrop fills the screen
+    BG_PALETTE[0] = RGB15(31, 0, 31);
+    for (int i = 0; i < BOOT_TRACE_FRAMES; i++) { while (REG_VCOUNT != 192); while (REG_VCOUNT == 192); }
+}
 #else
 #define boot_mark(top, bottom, color, stage) ((void)0)
+#define boot_mark0() ((void)0)
 #endif
 
 // Live Wi-Fi/socket processing plus the next OBD request once the adapter is ready.
@@ -66,7 +73,11 @@ static void service_link(void) {
     }
 }
 
+extern const volatile unsigned char g_arm9_pad[];
+
 int main(void) {
+    (void)g_arm9_pad[0];  // keep the R4 alignment padding linked in
+    boot_mark0();         // magenta: main() reached (trace builds only)
     if (isDSiMode()) {
         setCpuClock(true);
     }

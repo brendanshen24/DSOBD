@@ -5,7 +5,10 @@
 all: ds
 
 ds:
-	@$(MAKE) -f Makefile.gauges
+	@# R4 white screen guard: DMA reads RAM, so present() must flush the data cache before copying to VRAM.
+	@grep -q 'DC_FlushRange(s_top_backbuffer' source/main.c && grep -q 'DC_FlushRange(s_bottom_backbuffer' source/main.c \
+		|| { echo "error: source/main.c present() lost its DC_FlushRange calls (R4 white screen)"; exit 1; }
+	@python3 tools/build_ds.py
 	@# The original R4 kernel's DLDI auto-patch breaks BlocksDS ROMs (white screen); pre-patch its driver.
 	@$(MAKE) -f Makefile.gauges dldipatch
 

@@ -28,6 +28,26 @@ static void save_ppm(const char *directory, int mode, const char *screen, const 
     assert(fclose(f) == 0);
 }
 
+// Screens whose bottom is one full-height panel or dial rather than content + bottom row.
+static bool layout_exempt(int mode) {
+    return mode == DTEC_MODE_CAR_SELECT || mode == DTEC_MODE_OBD_TERMINAL || mode == DTEC_MODE_SIM_DASH ||
+           mode == DTEC_MODE_FORZA_STYLE || mode == DTEC_MODE_BEAMNG_STYLE;
+}
+
+// Nothing may draw in the gap between content and the bottom row.
+static void check_bottom_gap(const uint16_t *buf, int mode, int scenario) {
+    if (layout_exempt(mode)) return;
+    static uint16_t ref[SCREEN_W * SCREEN_H];
+    gfx_clear(ref, DTEC_COLOR_BLACK);
+    if (mode != DTEC_MODE_BIG_SPEED) gfx_background(ref);
+    for (int y = UI_CONTENT_END; y < UI_FOOT_Y; y++)
+        for (int x = 0; x < SCREEN_W; x++)
+            if (buf[y * SCREEN_W + x] != ref[y * SCREEN_W + x]) {
+                fprintf(stderr, "mode %d scenario %d draws into bottom gap at %d,%d\n", mode, scenario, x, y);
+                exit(1);
+            }
+}
+
 int main(int argc, char **argv) {
     uint16_t *buf = malloc(SCREEN_W * SCREEN_H * sizeof(*buf)); assert(buf);
     for (int scenario = 0; scenario < 3; scenario++) {
@@ -83,6 +103,7 @@ int main(int argc, char **argv) {
             g_dtec.screen_mode = mode;
             // Settle the existing eased gauge needles before taking a snapshot.
             for (int frame = 0; frame < 16; frame++) dtec_render_top(buf);
+            check_bottom_gap(buf, mode, scenario);
             if (argc > 1 && scenario == 1) save_ppm(argv[1], mode, "top", buf);
             dtec_render_bottom(buf);
             if (argc > 1 && scenario == 1) save_ppm(argv[1], mode, "bottom", buf);
@@ -93,5 +114,5 @@ int main(int argc, char **argv) {
     gfx_draw_char(buf, -10, -10, 'W', DTEC_COLOR_WHITE, 3);
     gfx_seg_number(buf, -20, -20, 64, 174, 14, 3, 255, DTEC_COLOR_WHITE, DTEC_COLOR_BLACK, 2);
     free(buf);
-    printf("All %d modes rendered with missing, live and maximum telemetry; asset clipping passed\n", DTEC_MODE_COUNT);
+    printf("All %d modes rendered with missing, live and maximum telemetry; bottom-row gap and asset clipping passed\n", DTEC_MODE_COUNT);
 }

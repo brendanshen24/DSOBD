@@ -16,6 +16,23 @@ static const char *const s_mode_names[DTEC_MODE_COUNT] = {
 };
 
 static DTEC_ScreenMode s_previous_mode = DTEC_MODE_MULTI_GAUGE;
+static bool s_net_menu = false;
+static int s_net_sel = 0;
+
+static void open_net_menu(void) {
+    s_net_menu = true;
+    dtec_3ds_net_scan_slots();
+    dtec_audio_play(DTEC_SFX_MOVE);
+}
+
+static void join_selected_slot(void) {
+    if (dtec_3ds_net_connect_slot(s_net_sel)) {
+        s_net_menu = false;
+        dtec_audio_play(DTEC_SFX_CONFIRM);
+    } else {
+        dtec_log("Slot is empty or unavailable");
+    }
+}
 
 static void change_mode(int delta) {
     DTEC_ScreenMode next = (DTEC_ScreenMode)((g_dtec.screen_mode + DTEC_MODE_COUNT + delta) % DTEC_MODE_COUNT);
@@ -47,6 +64,15 @@ static void confirm_vehicle(void) {
 }
 
 void dtec_3ds_handle_keys(uint32_t keys) {
+    if (s_net_menu) {
+        if ((keys & KEY_UP) && s_net_sel > 0) { s_net_sel--; dtec_audio_play(DTEC_SFX_MOVE); }
+        if ((keys & KEY_DOWN) && s_net_sel < DTEC_3DS_WIFI_SLOTS - 1) { s_net_sel++; dtec_audio_play(DTEC_SFX_MOVE); }
+        if (keys & KEY_A) join_selected_slot();
+        else if (keys & KEY_Y) open_net_menu();
+        else if (keys & KEY_B) { s_net_menu = false; dtec_audio_play(DTEC_SFX_MOVE); }
+        return;
+    }
+
     if (keys & (KEY_SELECT | KEY_RIGHT)) { change_mode(1); return; }
     if (keys & KEY_LEFT) { change_mode(-1); return; }
 
@@ -54,6 +80,7 @@ void dtec_3ds_handle_keys(uint32_t keys) {
         if (keys & KEY_B) toggle_settings();
         else if (keys & KEY_A) dtec_settings_toggle_sound();
         else if (keys & KEY_X) dtec_audio_play(DTEC_SFX_CONNECTED);
+        else if (keys & KEY_Y) open_net_menu();
         return;
     }
 
@@ -127,6 +154,22 @@ void dtec_3ds_handle_keys(uint32_t keys) {
 void dtec_3ds_handle_touch(int tx, int ty, bool is_down) {
     if (!is_down || (unsigned)tx >= BOT_W || (unsigned)ty >= BOT_H) return;
 
+    if (s_net_menu) {
+        for (int i = 0; i < DTEC_3DS_WIFI_SLOTS; i++) {
+            int ry = 50 + i * 40;
+            if (tx >= 6 && tx < 314 && ty >= ry && ty < ry + 36) {
+                if (s_net_sel == i) join_selected_slot();
+                else { s_net_sel = i; dtec_audio_play(DTEC_SFX_MOVE); }
+                return;
+            }
+        }
+        if (ty >= 194 && ty < 232) {
+            if (tx >= 6 && tx < 154) open_net_menu();
+            else if (tx >= 166 && tx < 314) dtec_3ds_handle_keys(KEY_B);
+        }
+        return;
+    }
+
     if (ty >= 4 && ty < 32) {
         if (tx >= 4 && tx < 58) change_mode(-1);
         else if (tx >= 262 && tx < 316) change_mode(1);
@@ -135,8 +178,9 @@ void dtec_3ds_handle_touch(int tx, int ty, bool is_down) {
     }
 
     if (g_dtec.screen_mode == DTEC_MODE_SETTINGS) {
-        if (tx >= 8 && tx < 312 && ty >= 42 && ty < 106) dtec_settings_toggle_sound();
-        else if (tx >= 8 && tx < 312 && ty >= 114 && ty < 152) dtec_audio_play(DTEC_SFX_CONNECTED);
+        if (tx >= 8 && tx < 312 && ty >= 50 && ty < 100) dtec_settings_toggle_sound();
+        else if (tx >= 8 && tx < 156 && ty >= 106 && ty < 142) dtec_audio_play(DTEC_SFX_CONNECTED);
+        else if (tx >= 164 && tx < 312 && ty >= 106 && ty < 142) open_net_menu();
         else if (tx >= 8 && tx < 312 && ty >= 188 && ty < 230) toggle_settings();
         return;
     }
@@ -219,24 +263,49 @@ void dtec_3ds_render_bottom(void) {
     /* Top navigation bar */
     ui_button(4.0f, 4.0f, 54.0f, 28.0f, "<", CLR_CYAN, false);
     ui_panel(62.0f, 4.0f, 196.0f, 28.0f, CLR_PANEL, CLR_BORDER_HL);
-    const char *name = s_mode_names[g_dtec.screen_mode % DTEC_MODE_COUNT];
+    const char *name = s_net_menu ? "NETWORK" : s_mode_names[g_dtec.screen_mode % DTEC_MODE_COUNT];
     ui_text(152.0f, 10.0f, 0.54f, CLR_WHITE, C2D_AlignCenter, name);
     ui_draw_gear(234.0f, 9.0f, 18.0f, CLR_CYAN);
     ui_button(262.0f, 4.0f, 54.0f, 28.0f, ">", CLR_CYAN, false);
 
+    if (s_net_menu) {
+        ui_text(12.0f, 36.0f, 0.44f, CLR_GRAY, 0, "SYSTEM WI-FI SLOTS");
+        for (int i = 0; i < DTEC_3DS_WIFI_SLOTS; i++) {
+            float ry = 50.0f + (float)i * 40.0f;
+            bool sel = (s_net_sel == i);
+            const char *ssid = g_3ds_slot_ssid[i];
+            bool active = ssid[0] && strcmp(ssid, g_dtec.wifi_ssid) == 0 &&
+                          g_dtec.net_status >= NET_WIFI_CONNECTED && g_dtec.net_status != NET_ERROR;
+            ui_panel(6.0f, ry, 308.0f, 36.0f, sel ? CLR_PANEL_HI : CLR_PANEL, sel ? CLR_CYAN : CLR_BORDER);
+            if (sel) C2D_DrawRectSolid(8.0f, ry + 7.0f, 0.0f, 3.0f, 22.0f, CLR_CYAN);
+            ui_textf(16.0f, ry + 4.0f, 0.42f, CLR_GRAY, 0, "SLOT %d", i + 1);
+            ui_text_clipped(16.0f, ry + 18.0f, 230.0f, 0.50f, ssid[0] ? CLR_WHITE : CLR_GRAY,
+                            ssid[0] ? ssid : "(empty)");
+            if (active) ui_text(306.0f, ry + 11.0f, 0.46f, CLR_GREEN, C2D_AlignRight, "ACTIVE");
+        }
+        u32 st_col = g_dtec.net_status == NET_ERROR ? CLR_RED :
+                     g_dtec.net_status == NET_OBD_CONNECTED ? CLR_GREEN : CLR_YELLOW;
+        ui_text_clipped(12.0f, 174.0f, 296.0f, 0.44f, st_col,
+                        g_dtec.status_msg[0] ? g_dtec.status_msg : "A / JOIN SELECTED SLOT");
+        ui_button(6.0f, 194.0f, 148.0f, 38.0f, "Y / RESCAN", CLR_WHITE, false);
+        ui_button(166.0f, 194.0f, 148.0f, 38.0f, "B / BACK", CLR_WHITE, false);
+        return;
+    }
+
     if (g_dtec.screen_mode == DTEC_MODE_SETTINGS) {
-        ui_text(12.0f, 36.0f, 0.44f, CLR_GRAY, 0, "AUDIO PREFERENCES");
-        ui_panel(8.0f, 42.0f, 304.0f, 64.0f, CLR_PANEL, CLR_BORDER_HL);
-        ui_text(18.0f, 52.0f, 0.58f, CLR_WHITE, 0, "SOUND EFFECTS");
+        ui_text(12.0f, 35.0f, 0.44f, CLR_GRAY, 0, "AUDIO PREFERENCES");
+        ui_panel(8.0f, 50.0f, 304.0f, 50.0f, CLR_PANEL, CLR_BORDER_HL);
+        ui_text(18.0f, 53.0f, 0.58f, CLR_WHITE, 0, "SOUND EFFECTS");
         ui_text(18.0f, 76.0f, 0.46f, CLR_GRAY, 0, "MENU + CONNECTION CUES");
-        ui_panel(236.0f, 56.0f, 64.0f, 26.0f,
+        ui_panel(236.0f, 62.0f, 64.0f, 26.0f,
                  g_dtec.sound_enabled ? CLR_GREEN_BG : CLR_DARK_GRAY,
                  g_dtec.sound_enabled ? CLR_GREEN : CLR_BORDER);
-        ui_text(268.0f, 61.0f, 0.54f, g_dtec.sound_enabled ? CLR_GREEN : CLR_GRAY,
+        ui_text(268.0f, 67.0f, 0.54f, g_dtec.sound_enabled ? CLR_GREEN : CLR_GRAY,
                 C2D_AlignCenter, g_dtec.sound_enabled ? "ON" : "OFF");
 
-        ui_button(8.0f, 114.0f, 304.0f, 38.0f, "X / TEST SOUND",
+        ui_button(8.0f, 106.0f, 148.0f, 36.0f, "X / TEST SOUND",
                   g_dtec.sound_enabled ? CLR_CYAN : CLR_GRAY, false);
+        ui_button(164.0f, 106.0f, 148.0f, 36.0f, "Y / NETWORK", CLR_CYAN, false);
         ui_text(160.0f, 162.0f, 0.48f, CLR_GRAY, C2D_AlignCenter,
                 g_dtec.settings_saved ? "SAVED TO sdmc:/dsobd-settings.ini" :
                 (g_dtec.settings_session_only ? "SESSION ONLY / SD UNAVAILABLE" : "A / TOGGLE SOUND"));

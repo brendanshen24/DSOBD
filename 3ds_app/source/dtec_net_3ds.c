@@ -27,6 +27,12 @@ static uint32_t s_reconnect_timer = 0;
 static uint32_t s_tcp_connect_ticks = 0;
 static bool s_tried_emu_loopback = false;
 static char s_cfg_ip[20] = DEFAULT_OBD_IP;
+static bool s_ac_ok = false;
+static Handle s_join_evt = 0;
+static int s_join_slot = -1;
+static uint32_t s_join_ticks = 0;
+
+char g_3ds_slot_ssid[DTEC_3DS_WIFI_SLOTS][33];
 
 static void set_status(DTEC_NetStatus st, const char *msg) {
     g_dtec.net_status = st;
@@ -68,13 +74,12 @@ static void apply_ini_kv(const char *key, const char *val, void *user) {
 }
 
 static void refresh_local_info(void) {
-    if (R_SUCCEEDED(acInit())) {
+    if (s_ac_ok) {
         char active_ssid[33];
         memset(active_ssid, 0, sizeof(active_ssid));
         if (R_SUCCEEDED(ACU_GetSSID(active_ssid)) && active_ssid[0] != '\0') {
             snprintf(g_dtec.wifi_ssid, sizeof(g_dtec.wifi_ssid), "%s", active_ssid);
         }
-        acExit();
     }
 
     struct in_addr host_ip;
@@ -154,6 +159,9 @@ void dtec_net_init(void) {
 
     ini_parse_file("sdmc:/dsobd.ini", apply_ini_kv, NULL);
 
+    /* ac session stays open for the app's lifetime: closing it would drop a slot we joined. */
+    if (!s_ac_ok) s_ac_ok = R_SUCCEEDED(acInit());
+
     set_status(NET_WIFI_CONNECTING, "Init 3DS SOC...");
 
     if (!s_soc_buffer) {
@@ -177,6 +185,14 @@ void dtec_net_init(void) {
 
 void dtec_net_cleanup(void) {
     close_socket();
+    if (s_join_evt) {
+        svcCloseHandle(s_join_evt);
+        s_join_evt = 0;
+    }
+    if (s_ac_ok) {
+        acExit();
+        s_ac_ok = false;
+    }
     if (s_soc_buffer) {
         socExit();
         free(s_soc_buffer);
@@ -222,8 +238,84 @@ bool dtec_net_is_connected(void) {
     return g_dtec.net_status == NET_OBD_CONNECTED;
 }
 
+void dtec_3ds_net_scan_slots(void) {
+    int found = 0;
+    for (int i = 0; i < DTEC_3DS_WIFI_SLOTS; i++) {
+        /* 0x20-byte SSID followed by its length byte; padded for safety. */
+        u8 raw[0x40];
+        memset(raw, 0, sizeof(raw));
+        g_3ds_slot_ssid[i][0] = '\0';
+        if (!s_ac_ok || R_FAILED(ACI_LoadNetworkSetting((u32)i)) ||
+            R_FAILED(ACI_GetNetworkWirelessEssidSecuritySsid(raw))) {
+            continue;
+        }
+        size_t len = raw[0x20];
+        if (len == 0 || len > 32) len = strnlen((const char *)raw, 32);
+        memcpy(g_3ds_slot_ssid[i], raw, len);
+        g_3ds_slot_ssid[i][len] = '\0';
+        if (len) found++;
+    }
+    dtec_log(found ? "WiFi slots scanned" : "No saved WiFi slots read");
+}
+
+bool dtec_3ds_net_connect_slot(int slot) {
+    if (slot < 0 || slot >= DTEC_3DS_WIFI_SLOTS || !g_3ds_slot_ssid[slot][0] || !s_ac_ok) return false;
+    if (!s_join_evt && R_FAILED(svcCreateEvent(&s_join_evt, RESET_ONESHOT))) {
+        set_status(NET_ERROR, "Join event failed");
+        return false;
+    }
+
+    close_socket();
+    acuConfig cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    /* AllowApType bit N = system connection slot N+1, so only the chosen slot is tried. */
+    if (R_FAILED(ACU_CreateDefaultConfig(&cfg)) ||
+        R_FAILED(ACU_SetAllowApType(&cfg, (u8)(1u << slot))) ||
+        R_FAILED(ACU_SetRequestEulaVersion(&cfg)) ||
+        R_FAILED(ACU_ConnectAsync(&cfg, s_join_evt))) {
+        set_status(NET_ERROR, "WiFi join request failed");
+        return false;
+    }
+
+    s_join_slot = slot;
+    s_join_ticks = 0;
+    snprintf(g_dtec.wifi_ssid, sizeof(g_dtec.wifi_ssid), "%s", g_3ds_slot_ssid[slot]);
+    char msg[48];
+    snprintf(msg, sizeof(msg), "Joining %.32s...", g_3ds_slot_ssid[slot]);
+    set_status(NET_WIFI_CONNECTING, msg);
+    return true;
+}
+
+static void poll_slot_join(void) {
+    /* dtec_net_update runs twice per frame, so 1800 ticks is about 15 s. */
+    bool signalled = svcWaitSynchronization(s_join_evt, 0) == 0;
+    if (!signalled && ++s_join_ticks < 1800) return;
+
+    int slot = s_join_slot;
+    s_join_slot = -1;
+    char ssid[33];
+    memset(ssid, 0, sizeof(ssid));
+    if (R_SUCCEEDED(ACU_GetSSID(ssid)) && strcmp(ssid, g_3ds_slot_ssid[slot]) == 0) {
+        char msg[48];
+        snprintf(msg, sizeof(msg), "Joined %.32s", ssid);
+        set_status(NET_WIFI_CONNECTED, msg);
+        dtec_net_reconnect();
+        return;
+    }
+    u32 err = 0;
+    ACU_GetLastErrorCode(&err);
+    char msg[48];
+    snprintf(msg, sizeof(msg), signalled ? "Join failed (%08lX)" : "Join timeout", (unsigned long)err);
+    set_status(NET_ERROR, msg);
+    s_reconnect_timer = 0;
+}
+
 void dtec_net_update(void) {
     if (!s_soc_buffer) return;
+    if (s_join_slot >= 0) {
+        poll_slot_join();
+        return;
+    }
 
     switch (g_dtec.net_status) {
         case NET_WIFI_CONNECTING:

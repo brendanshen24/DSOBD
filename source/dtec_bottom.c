@@ -166,7 +166,7 @@ void dtec_handle_touch(int tx, int ty, bool is_down) {
 
 static void button(uint16_t *buf, int x, int y, int w, int h, const char *label, uint16_t color) {
     gfx_panel(buf, x, y, w, h, DTEC_COLOR_PANEL, DTEC_COLOR_BORDER);
-    gfx_draw_str_clipped(buf, x + (w - (int)strlen(label) * 8) / 2, y + (h - 8) / 2, w - 4, label, color, 1);
+    gfx_draw_str_clipped(buf, x + (w - gfx_text_width(label, 1)) / 2, y + (h - 8) / 2, w - 4, label, color, 1);
 }
 
 static void render_code_list(uint16_t *buf) {
@@ -175,7 +175,7 @@ static void render_code_list(uint16_t *buf) {
     gfx_panel(buf, 4, 57, 248, 131, DTEC_COLOR_BLACK, DTEC_COLOR_BORDER);
     if (g_dtec.dtc_count == 0) {
         const char *msg = g_dtec.scanning ? "READING ECU..." : !g_dtec.codes_read ? "A / SCAN TO READ CODES" : "NO TROUBLE CODES";
-        gfx_draw_str(buf, 128 - (int)strlen(msg) * 4, 118, msg, g_dtec.codes_read ? DTEC_COLOR_GREEN : DTEC_COLOR_GRAY, 1);
+        gfx_draw_str_align(buf, 128, 118, 1, msg, g_dtec.codes_read ? DTEC_COLOR_GREEN : DTEC_COLOR_GRAY, 1);
     }
     for (int i = 0; i < g_dtec.dtc_count; i++) {
         char code[8], line[24];
@@ -194,7 +194,7 @@ void dtec_render_bottom(uint16_t *buf) {
     button(buf, 207, 2, 48, 22, ">", DTEC_COLOR_CYAN);
     gfx_panel(buf, 51, 2, 154, 22, DTEC_COLOR_PANEL, DTEC_COLOR_BORDER_HL);
     const char *name = s_mode_names[g_dtec.screen_mode % DTEC_MODE_COUNT];
-    gfx_draw_str(buf, 118 - (int)strlen(name) * 4, 9, name, DTEC_COLOR_WHITE, 1);
+    gfx_draw_str_align(buf, 118, 9, 1, name, DTEC_COLOR_WHITE, 1);
     gfx_gear(buf, 184, 6, DTEC_COLOR_CYAN);
 
     if (g_dtec.screen_mode == DTEC_MODE_SETTINGS) {

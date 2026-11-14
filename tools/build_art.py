@@ -23,12 +23,8 @@ def rgb555(im):
             for r, g, b, a in im.convert("RGBA").getdata()]
 
 
-# Brushed instrument deck. Very subtle texture avoids competing with live data.
-deck = Image.new("RGB", (256, 192))
-deck.putdata([(int(8 + 7 * (1-y/192)) + ((x+y) % 4 == 0),
-               int(13 + 8 * (1-y/192)), int(20 + 12 * (1-y/192)))
-              for y in range(192) for x in range(256)])
-emit("dtec_art_deck", rgb555(deck))
+# The brushed instrument deck is a formula, so source/dtec_gfx.c computes it at
+# startup instead of storing 96 KB in the ARM9 binary (keeps it under 512 KB).
 
 # Original antialiased metal dial sprite, drawn at 3x then reduced once offline.
 s = 3
@@ -50,20 +46,23 @@ for radius in range(87*s, 0, -1):
 dr.arc((5*s, 5*s, 171*s, 171*s), 205, 305, fill=(200, 223, 236, 255), width=s)
 emit("dtec_art_dial", rgb555(dial.resize((176, 176), Image.Resampling.LANCZOS)))
 
-# Alpha glyph sprites keep the existing fixed-width layout at 1x, 2x and 3x,
-# but render each size directly, rather than enlarging eight-pixel characters.
+# Proportional alpha glyph sprites (like the PSP/3DS Barlow atlases): each glyph
+# is drawn left-aligned in a (10*scale) x (8*scale) cell with its own advance.
+adv = []
 for scale in (1, 2, 3):
-    size = 8 * scale
+    cw, ch_h = 10 * scale, 8 * scale
     font = ImageFont.truetype(TEXT_FONT, 10 * scale * 4)
     values = []
     for ch in map(chr, range(32, 127)):
-        glyph = Image.new("L", (size*4, size*4))
+        glyph = Image.new("L", (cw*4, ch_h*4))
         d = ImageDraw.Draw(glyph)
-        advance = d.textlength(ch, font=font)
-        d.text(((size*4-advance)/2, 7*scale*4), ch, font=font, anchor="ls", fill=255)
-        glyph = glyph.resize((size, size), Image.Resampling.LANCZOS)
+        d.text((0, 7*scale*4), ch, font=font, anchor="ls", fill=255)
+        a = round(d.textlength(ch, font=font) / 4)
+        adv.append(min(cw, max(3 * scale if ch == " " else 1, a)))  # Barlow's 2px space vanishes on DS
+        glyph = glyph.resize((cw, ch_h), Image.Resampling.LANCZOS)
         values.extend((v+8)//17 for v in glyph.getdata())
     emit(f"dtec_font_{scale}", values, "uint8_t")
+emit("dtec_font_adv", adv, "uint8_t")
 
 font = ImageFont.truetype(FONT, 145*3)
 values = []
