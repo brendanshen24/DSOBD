@@ -5,25 +5,36 @@
 #include <stdio.h>
 #include <string.h>
 
-#include "common.h"
-#include "config.h"
-#include "net.h"
-#include "obd.h"
-#include "ui.h"
+#include "dtec_common.h"
+#include "dtec_net.h"
+#include "dtec_obd.h"
+#include "dtec_audio.h"
+#include "dtec_settings.h"
+#include "dtec_logger.h"
+#include "gfx_psp.h"
+#include "platform_psp.h"
 
-PSP_MODULE_INFO("DSOBD_PSP_Terminal", 0, 1, 1);
+PSP_MODULE_INFO("PSPOBD", 0, 2, 0);
 PSP_MAIN_THREAD_ATTR(THREAD_ATTR_USER | THREAD_ATTR_VFPU);
 PSP_HEAP_SIZE_KB(-1024);
 
-AppState g_state;
+DTEC_State g_dtec;
+PspState g_psp;
+
 static volatile bool s_running = true;
+static SceInt64 s_start_us = 0;
+
+uint32_t psp_elapsed_ms(void) {
+    SceInt64 now = sceKernelGetSystemTimeWide();
+    if (now < s_start_us) return 0;
+    return (uint32_t)((now - s_start_us) / 1000);
+}
 
 static int exit_callback(int arg1, int arg2, void *common) {
     (void)arg1;
     (void)arg2;
     (void)common;
     s_running = false;
-    sceKernelExitGame();
     return 0;
 }
 
@@ -43,15 +54,25 @@ static void setup_callbacks(void) {
     }
 }
 
-static void state_init(void) {
-    memset(&g_state, 0, sizeof(g_state));
-    g_state.ui_mode = UI_MODE_TERMINAL;
-    g_state.net_status = NET_STATUS_DISCONNECTED;
-    strncpy(g_state.status_msg, "Initializing...", sizeof(g_state.status_msg) - 1);
-    strncpy(g_state.wifi_ssid, DEFAULT_OBD_SSID, sizeof(g_state.wifi_ssid) - 1);
-    strncpy(g_state.target_ip, DEFAULT_OBD_IP, sizeof(g_state.target_ip) - 1);
-    g_state.target_port = DEFAULT_OBD_PORT;
-    g_state.coolant_temp_c = -999;
+static void poll_psp_power(void) {
+    if (scePowerIsBatteryExist()) {
+        int pct = scePowerGetBatteryLifePercent();
+        g_psp.battery_pct = (pct >= 0 && pct <= 100) ? pct : -1;
+        g_psp.battery_charging = (scePowerIsBatteryCharging() != 0);
+    } else {
+        g_psp.battery_pct = -1;
+        g_psp.battery_charging = false;
+    }
+    g_psp.ac_online = (scePowerIsPowerOnline() != 0);
+}
+
+static void service_link(void) {
+    dtec_net_update();
+    dtec_audio_update();
+    if (g_dtec.screen_mode != DTEC_MODE_CAR_SELECT &&
+        g_dtec.screen_mode != PSP_MODE_WIFI) {
+        dtec_obd_poll_tick(psp_elapsed_ms());
+    }
 }
 
 int main(int argc, char *argv[]) {
@@ -59,95 +80,78 @@ int main(int argc, char *argv[]) {
     (void)argv;
 
     setup_callbacks();
-
-    // Boost PSP CPU to 333 MHz
     scePowerSetClockFrequency(333, 333, 166);
+    s_start_us = sceKernelGetSystemTimeWide();
 
     sceCtrlSetSamplingCycle(0);
     sceCtrlSetSamplingMode(PSP_CTRL_MODE_ANALOG);
 
-    state_init();
-    config_load();
+    memset(&g_dtec, 0, sizeof(g_dtec));
+    memset(&g_psp, 0, sizeof(g_psp));
+    g_dtec.screen_mode = DTEC_MODE_MULTI_GAUGE;
+    g_psp.battery_pct = -1;
+    g_psp.peak_coolant_c = -999;
 
-    snprintf(g_state.wifi_ssid, sizeof(g_state.wifi_ssid), "%s", g_config.wifi_ssid);
-    snprintf(g_state.target_ip, sizeof(g_state.target_ip), "%s", g_config.obd_ip);
-    g_state.target_port = g_config.obd_port;
-    g_state.apctl_profile_index = g_config.apctl_profile_index;
+    if (!gfx_psp_init()) {
+        sceKernelExitGame();
+        return 1;
+    }
 
-    ui_init();
-    obd_init();
-    net_init();
+    dtec_obd_init();
+    dtec_settings_init();
+    psp_ui_init();
+    dtec_audio_init();
+    dtec_net_init();
+    poll_psp_power();
 
     SceCtrlData pad;
     uint32_t prev_buttons = 0;
+    uint32_t frame = 0;
 
     while (s_running) {
         sceCtrlReadBufferPositive(&pad, 1);
         uint32_t k_down = pad.Buttons & ~prev_buttons;
         prev_buttons = pad.Buttons;
 
-        if (g_state.ui_mode == UI_MODE_WIFI_SCAN) {
-            if (k_down & PSP_CTRL_UP) {
-                if (g_state.scan_selected_idx > 0) {
-                    g_state.scan_selected_idx--;
-                }
-            }
-            if (k_down & PSP_CTRL_DOWN) {
-                if (g_state.scan_selected_idx + 1 < g_state.scan_ap_count) {
-                    g_state.scan_selected_idx++;
-                }
-            }
-            if (k_down & PSP_CTRL_CROSS) {
-                net_connect_to_ap_index(g_state.scan_selected_idx);
-            }
-            if (k_down & PSP_CTRL_CIRCLE) {
-                net_stop_scan();
-                ui_log_system("Wi-Fi selection cancelled");
-            }
-            if (k_down & PSP_CTRL_SQUARE) {
-                net_start_scan();
-            }
-        } else {
-            if (k_down & PSP_CTRL_CROSS) {
-                obd_send_cmd("ATZ");
-            }
-            if (k_down & PSP_CTRL_CIRCLE) {
-                obd_send_cmd("010C");
-            }
-            if (k_down & PSP_CTRL_SQUARE) {
-                obd_send_cmd("010D");
-            }
-            if (k_down & PSP_CTRL_TRIANGLE) {
-                obd_send_cmd("ATRV");
-            }
-            if (k_down & PSP_CTRL_LTRIGGER) {
-                obd_send_cmd("0105");
-            }
-            if (k_down & PSP_CTRL_RTRIGGER) {
-                obd_send_cmd("0100");
-            }
-            if (k_down & PSP_CTRL_START) {
-                g_state.auto_poll = !g_state.auto_poll;
-                ui_log_system(g_state.auto_poll ? "Auto-Polling: ENABLED" : "Auto-Polling: DISABLED");
-            }
-            if (k_down & PSP_CTRL_SELECT) {
-                net_start_scan();
-            }
-            if (k_down & PSP_CTRL_UP) {
-                ui_clear_log();
-            }
+        int8_t lx = (int8_t)((int)pad.Lx - 128);
+        int8_t ly = (int8_t)((int)pad.Ly - 128);
+
+        psp_ui_handle_input(k_down, pad.Buttons, lx, ly);
+
+        service_link();
+        dtec_logger_tick(psp_elapsed_ms());
+
+        if ((frame % 60u) == 0u) {
+            poll_psp_power();
+        }
+        if ((frame % 120u) == 0u && g_psp.keep_awake &&
+            (g_dtec.net_status == NET_OBD_CONNECTED || g_dtec.logging)) {
+            scePowerTick(PSP_POWER_TICK_DISPLAY);
         }
 
-        net_update();
-
-        if (g_state.ui_mode == UI_MODE_TERMINAL) {
-            obd_poll_tick();
+        if ((frame++ % 10u) == 0u) {
+            for (int i = 0; i < GRAPH_HISTORY_LEN - 1; i++) {
+                g_dtec.hist_boost[i] = g_dtec.hist_boost[i + 1];
+                g_dtec.hist_rpm[i] = g_dtec.hist_rpm[i + 1];
+                g_dtec.hist_tps[i] = g_dtec.hist_tps[i + 1];
+            }
+            g_dtec.hist_boost[GRAPH_HISTORY_LEN - 1] = g_dtec.boost_kpa;
+            g_dtec.hist_rpm[GRAPH_HISTORY_LEN - 1] = g_dtec.rpm;
+            g_dtec.hist_tps[GRAPH_HISTORY_LEN - 1] = g_dtec.tps_pct;
+            if (g_dtec.hist_count < GRAPH_HISTORY_LEN) g_dtec.hist_count++;
         }
 
-        ui_render();
-        sceDisplayWaitVblankStart();
+        psp_ui_render();
+        service_link();
     }
 
+    if (g_dtec.logging) {
+        dtec_logger_toggle();
+    }
+    psp_ui_fini();
+    dtec_net_cleanup();
+    dtec_audio_shutdown();
+    gfx_psp_fini();
     sceKernelExitGame();
     return 0;
 }

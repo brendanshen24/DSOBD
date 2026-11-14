@@ -32,28 +32,97 @@ def get_rpm(t):
     return int(max(750, min(5500, base + amp)))
 
 
-def pid_reply(cmd, t):
+VIN = "1HGCM82633A004352"
+CAL_ID = b"37805RBBA530"
+ECU_NAME = b"ECM\x00-EngineControl"
+MISFIRE_MIDS = [0xA2, 0xA3, 0xA4, 0xA5]  # 4 cylinders
+FREEZE = {0x04: [0x45], 0x05: [0x84], 0x0C: [0x1F, 0x40], 0x0D: [0x64]}  # 27 %, 92 C, 2000 rpm, 100 km/h
+
+
+def mode01(t, stored):
+    """Live mode 01 data bytes by PID. Supported-PID bitmaps are derived from this."""
     rpm = get_rpm(t)
-    if cmd == "0100":
-        return "41 00 BE 3E B8 11"
-    if cmd == "010C":
-        raw = rpm * 4
-        return f"41 0C {(raw >> 8) & 0xFF:02X} {raw & 0xFF:02X}"
-    if cmd == "010D":
-        return f"41 0D {int(max(0, min(120, 55 + 40 * math.sin(t * 0.3)))):02X}"
-    if cmd == "0105":
-        return "41 05 84"  # 92 C
-    if cmd == "010B":
-        kpa = 36 if rpm < 1200 else int(36 + (rpm - 1200) / 4000.0 * 175)
-        return f"41 0B {max(25, min(240, kpa)):02X}"
-    if cmd == "0111":
-        pct = max(10, min(95, rpm / 6000.0 * 100))
-        return f"41 11 {int(pct * 255 / 100):02X}"
-    if cmd == "0104":
-        return "41 04 45"  # 27 %
-    if cmd == "03":
-        return "43 00"
-    return None
+    kpa = 36 if rpm < 1200 else int(36 + (rpm - 1200) / 4000.0 * 175)
+    word = lambda v: [(v >> 8) & 0xFF, v & 0xFF]
+    return {
+        # MIL + code count; misfire/fuel/components complete, EVAP incomplete -> 6/7 ready
+        0x01: [(0x80 | len(stored)) if stored else 0, 0x07, 0x65, 0x04],
+        0x04: [0x45],
+        0x05: [0x84],
+        0x06: [0x80 + int(4 * math.sin(t))],
+        0x07: [0x84],
+        0x0B: [max(25, min(240, kpa))],
+        0x0C: word(rpm * 4),
+        0x0D: [int(max(0, min(120, 55 + 40 * math.sin(t * 0.3))))],
+        0x0E: [0x8C],
+        0x0F: [0x46],
+        0x10: word(int(rpm * 0.6)),
+        0x11: [int(max(10, min(95, rpm / 6000.0 * 100)) * 255 / 100)],
+        0x14: [0x5A, 0x80],
+        0x1C: [0x01],  # OBD-II (CARB)
+        0x1F: word(int(t)),
+        0x21: word(12),
+        0x2F: [0xA0],
+        0x30: [3],
+        0x31: word(1234),
+        0x33: [0x65],
+        0x42: word(14100),
+        0x46: [0x3C],
+        0x5C: [0x7D],
+        0x5E: word(int(rpm / 100)),
+        0x51: [0x01],  # gasoline
+        0x61: [125 + int(rpm / 200)],
+        0x62: [125 + int(rpm / 250)],
+        0x63: word(250),
+        0x77: [0x01, 0x46, 0, 0, 0],
+        0x78: [0x01] + word((550 + 40) * 10) + [0] * 6,  # 9 bytes: multi-frame on CAN
+        0xA6: [0x00, 0x12, 0xD6, 0x87],  # 123456.7 km
+    }
+
+
+def supported_bitmap(pids, base):
+    bits = 0
+    for pid in pids:
+        if base < pid <= base + 32:
+            bits |= 1 << (32 - (pid - base))
+    if any(pid > base + 32 for pid in pids):
+        bits |= 1  # next range supported
+    return " ".join(f"{(bits >> s) & 0xFF:02X}" for s in (24, 16, 8, 0))
+
+
+def pid_reply(cmd, t, stored=()):
+    pids = mode01(t, stored)
+    pid = int(cmd[2:4], 16)
+    if pid % 0x20 == 0 and pid <= 0xA0:
+        return f"41 {pid:02X} {supported_bitmap(pids, pid)}"
+    if pid not in pids:
+        return None
+    return can_reply([0x41, pid] + pids[pid])
+
+
+def can_reply(data):
+    """ISO 15765 with headers off: one line, or a byte count plus numbered frames."""
+    hexes = [f"{b:02X}" for b in data]
+    if len(data) <= 7:
+        return " ".join(hexes)
+    lines = [f"{len(data):03X}", "0: " + " ".join(hexes[:6])]
+    rest = hexes[6:]
+    for i in range(0, len(rest), 7):
+        lines.append(f"{(i // 7 + 1) % 16:X}: " + " ".join(rest[i:i + 7]))
+    return "\r".join(lines)
+
+
+def misfire_reply(mid, drive, avg):
+    """Mode 06 CAN records: MID TID UASID value min max; TID 0B = 10-drive avg, 0C = this drive."""
+    rec = lambda tid, v: [mid, tid, 0x24, v >> 8, v & 0xFF, 0, 0, 0xFF, 0xFF]
+    return can_reply([0x46] + rec(0x0B, avg) + rec(0x0C, drive))
+
+
+def codes_reply(mode, codes):
+    data = [0x40 + mode, len(codes)]
+    for code in codes:
+        data += [int(code[1:3], 16), int(code[3:5], 16)]  # P-codes only
+    return can_reply(data)
 
 
 def get_voltage(t):
@@ -70,6 +139,45 @@ class Session:
         self.buffer = ""
         self.discard_line = False
         self.stats = {"cmds": 0, "stopped": 0}
+        self.stored = ["P0133", "P0420"]
+        self.pending_codes = ["P0171"]
+        self.permanent = ["P0420"]  # stays until the monitor passes, like a real ECU
+        self.misfires = {0xA4: (14, 6)}  # cylinder 3: this drive, 10-drive average
+
+    def obd(self, cmd, t):
+        if len(cmd) == 5 and cmd.startswith("01"):
+            cmd = cmd[:4]  # ELM327 v1.3+ response-count suffix
+        if len(cmd) == 4 and cmd.startswith("01"):
+            return pid_reply(cmd, t, self.stored)
+        if cmd == "03":
+            return codes_reply(0x03, self.stored)
+        if cmd == "07":
+            return codes_reply(0x07, self.pending_codes)
+        if cmd == "0A":
+            return codes_reply(0x0A, self.permanent)
+        if cmd == "04":
+            self.stored, self.pending_codes, self.misfires = [], [], {}
+            return "44"
+        if cmd == "0902":
+            return can_reply([0x49, 0x02, 0x01] + list(VIN.encode("ascii")))
+        if cmd == "0904":
+            return can_reply([0x49, 0x04, 0x01] + list(CAL_ID.ljust(16, b"\x00")))
+        if cmd == "090A":
+            return can_reply([0x49, 0x0A, 0x01] + list(ECU_NAME.ljust(20, b"\x00")))
+        if cmd == "06A0":
+            bits = sum(1 << (0xC0 - mid) for mid in [0xA1] + MISFIRE_MIDS)
+            return can_reply([0x46, 0xA0] + list(bits.to_bytes(4, "big")))
+        if len(cmd) == 4 and cmd.startswith("06") and int(cmd[2:], 16) in MISFIRE_MIDS:
+            mid = int(cmd[2:], 16)
+            return misfire_reply(mid, *self.misfires.get(mid, (0, 0)))
+        if len(cmd) == 6 and cmd.startswith("02") and self.stored:
+            pid = int(cmd[2:4], 16)
+            if pid == 0x02:
+                code = self.stored[0]
+                return f"42 02 00 {code[1:3]} {code[3:5]}"
+            if pid in FREEZE:
+                return f"42 {pid:02X} 00 " + " ".join(f"{b:02X}" for b in FREEZE[pid])
+        return None
 
     def send(self, text):
         self.conn.sendall(text.encode("ascii"))
@@ -99,9 +207,15 @@ class Session:
             resp = "\rOK\r"
         elif cmd == "ATRV":
             resp = f"\r{get_voltage(t)}\r"
+        elif cmd == "ATDP":
+            resp = "\rAUTO, ISO 15765-4 (CAN 11/500)\r"
+        elif cmd == "ATDPN":
+            resp = "\rA6\r"
+        elif cmd.startswith("AT"):
+            resp = "\r?\r"
         else:
-            reply = pid_reply(cmd, t)
-            resp = f"\r{reply}\r" if reply else "\r?\r"
+            reply = self.obd(cmd, t)
+            resp = f"\r{reply}\r" if reply else "\rNO DATA\r"
             if reply and not FAST:
                 delay = random.uniform(0.05, 0.30)
                 if self.need_search:
@@ -184,7 +298,9 @@ def main():
     print("======================================================")
     print("  Veepeak OBDCheck VP01 WiFi Simulator")
     print(f"  Listening on {HOST}:{PORT}  ({'fast' if FAST else 'realistic'} mode)")
-    print("  PIDs: 0100 010C 010D 0105 010B 0111 0104, ATRV")
+    print("  Mode 01 PIDs, codes 03/07/0A, clear 04, freeze frame 02, misfire 06,")
+    print("  VIN / calibration ID / ECU name 0902/0904/090A")
+    print("  AT: Z E0/1 L0/1 H0/1 AT1/2 SPn RV DP DPN")
     print("======================================================")
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)

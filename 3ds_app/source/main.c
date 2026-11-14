@@ -1,161 +1,132 @@
 #include <3ds.h>
+#include <citro2d.h>
 #include <stdio.h>
 #include <string.h>
 
-#include "common.h"
-#include "config.h"
-#include "net.h"
-#include "obd.h"
-#include "ui.h"
+#include "dtec_common.h"
+#include "dtec_net.h"
+#include "dtec_obd.h"
+#include "dtec_audio.h"
+#include "dtec_settings.h"
+#include "dtec_logger.h"
+#include "gfx3ds.h"
+#include "platform_3ds.h"
 
-AppState g_state;
+DTEC_State g_dtec;
 
-static void state_init(void) {
-    memset(&g_state, 0, sizeof(g_state));
-    g_state.ui_mode = UI_MODE_TERMINAL;
-    g_state.net_status = NET_STATUS_DISCONNECTED;
-    strncpy(g_state.status_msg, "Initializing...", sizeof(g_state.status_msg) - 1);
-    strncpy(g_state.wifi_ssid, DEFAULT_OBD_SSID, sizeof(g_state.wifi_ssid) - 1);
-    strncpy(g_state.target_ip, DEFAULT_OBD_IP, sizeof(g_state.target_ip) - 1);
-    g_state.target_port = DEFAULT_OBD_PORT;
-    g_state.coolant_temp_c = -999;
+static uint64_t s_start_ms;
+
+static uint32_t elapsed_ms(void) {
+    return (uint32_t)(osGetTime() - s_start_ms);
+}
+
+static void service_link(void) {
+    dtec_net_update();
+    dtec_audio_update();
+    if (g_dtec.screen_mode != DTEC_MODE_CAR_SELECT) {
+        dtec_obd_poll_tick(elapsed_ms());
+    }
 }
 
 int main(int argc, char **argv) {
     (void)argc;
     (void)argv;
 
-    // 1. Enable New 3DS 804 MHz speedup if available
     osSetSpeedupEnable(true);
+    s_start_ms = osGetTime();
 
-    // 2. Initialize state & load configuration
-    state_init();
-    config_load();
+    gfxInitDefault();
+    C3D_Init(C3D_DEFAULT_CMDBUF_SIZE);
+    C2D_Init(C2D_DEFAULT_MAX_OBJECTS);
+    C2D_Prepare();
 
-    snprintf(g_state.wifi_ssid, sizeof(g_state.wifi_ssid), "%s", g_config.wifi_ssid);
-    snprintf(g_state.target_ip, sizeof(g_state.target_ip), "%s", g_config.obd_ip);
-    g_state.target_port = g_config.obd_port;
+    C3D_RenderTarget *target_top = C2D_CreateScreenTarget(GFX_TOP, GFX_LEFT);
+    C3D_RenderTarget *target_bottom = C2D_CreateScreenTarget(GFX_BOTTOM, GFX_LEFT);
 
-    // 3. Initialize dual-screen text consoles
-    ui_init();
+    if (!gfx3ds_init()) {
+        C2D_Fini();
+        C3D_Fini();
+        gfxExit();
+        return 1;
+    }
 
-    // 4. Initialize OBD protocol engine
-    obd_init();
+    memset(&g_dtec, 0, sizeof(g_dtec));
+    g_dtec.screen_mode = DTEC_MODE_MULTI_GAUGE;
+    dtec_obd_init();
+    dtec_settings_init();
+    dtec_audio_init();
+    dtec_net_init();
 
-    // 5. Initialize 3DS SOC network
-    net_init();
-
-    uint32_t frame = 0;
     touchPosition touch;
+    bool was_touching = false;
+    uint32_t frame = 0;
 
-    // 6. Main 3DS APT loop
     while (aptMainLoop()) {
         hidScanInput();
         u32 k_down = hidKeysDown();
+        u32 k_held = hidKeysHeld();
 
-        if (k_down & KEY_START) {
+        /* START + SELECT exits cleanly to Homebrew Launcher without overriding single START/SELECT. */
+        if ((k_held & (KEY_START | KEY_SELECT)) == (KEY_START | KEY_SELECT)) {
             break;
         }
 
-        if (g_state.ui_mode == UI_MODE_WIFI_SCAN) {
-            if (k_down & KEY_UP) {
-                if (g_state.scan_selected_idx > 0) {
-                    g_state.scan_selected_idx--;
-                }
+        if (k_held & KEY_TOUCH) {
+            hidTouchRead(&touch);
+            if (!was_touching) {
+                dtec_3ds_handle_touch((int)touch.px, (int)touch.py, true);
             }
-            if (k_down & KEY_DOWN) {
-                if (g_state.scan_selected_idx + 1 < g_state.scan_ap_count) {
-                    g_state.scan_selected_idx++;
-                }
-            }
-            if (k_down & KEY_A) {
-                net_connect_to_ap_index(g_state.scan_selected_idx);
-            }
-            if (k_down & KEY_B) {
-                net_stop_scan();
-                ui_clear_log();
-                ui_log_system("Wi-Fi selection cancelled");
-            }
-            if (k_down & KEY_X) {
-                net_start_scan();
-            }
-
-            if (k_down & KEY_TOUCH) {
-                hidTouchRead(&touch);
-                int row = touch.py / 8;
-                if (row >= 2 && row <= 19) {
-                    int clicked_idx = g_state.scan_scroll_offset + (row - 2);
-                    if (clicked_idx >= 0 && clicked_idx < g_state.scan_ap_count) {
-                        if (clicked_idx == g_state.scan_selected_idx) {
-                            net_connect_to_ap_index(clicked_idx);
-                        } else {
-                            g_state.scan_selected_idx = clicked_idx;
-                        }
-                    }
-                } else if (row == 21) {
-                    net_connect_to_ap_index(g_state.scan_selected_idx);
-                } else if (row == 22) {
-                    net_start_scan();
-                } else if (row == 23) {
-                    net_stop_scan();
-                    ui_clear_log();
-                    ui_log_system("Wi-Fi selection cancelled");
-                }
-            }
-        } else {
-            if (k_down & KEY_A) {
-                obd_send_cmd("ATZ");
-            }
-            if (k_down & KEY_B) {
-                obd_send_cmd("010C");
-            }
-            if (k_down & KEY_X) {
-                obd_send_cmd("010D");
-            }
-            if (k_down & KEY_Y) {
-                obd_send_cmd("ATRV");
-            }
-            if (k_down & KEY_L) {
-                obd_send_cmd("0105");
-            }
-            if (k_down & KEY_R) {
-                obd_send_cmd("0100");
-            }
-            if (k_down & KEY_DRIGHT) {
-                g_state.auto_poll = !g_state.auto_poll;
-                ui_log_system(g_state.auto_poll ? "Auto-Polling: ENABLED" : "Auto-Polling: DISABLED");
-            }
-            if (k_down & KEY_SELECT) {
-                net_start_scan();
-            }
-            if (k_down & KEY_DUP) {
-                ui_clear_log();
-            }
+            was_touching = true;
+        } else if (was_touching) {
+            was_touching = false;
         }
 
-        net_update();
-
-        if (g_state.ui_mode == UI_MODE_TERMINAL) {
-            obd_poll_tick();
+        if (k_down) {
+            dtec_3ds_handle_keys(k_down);
         }
 
-        if (g_state.ui_mode == UI_MODE_WIFI_SCAN) {
-            if ((frame++ % 4) == 0) {
-                ui_render_top();
-                ui_render_bottom();
+        service_link();
+        dtec_logger_tick(elapsed_ms());
+
+        if ((frame++ % 10) == 0) {
+            for (int i = 0; i < GRAPH_HISTORY_LEN - 1; i++) {
+                g_dtec.hist_boost[i] = g_dtec.hist_boost[i + 1];
+                g_dtec.hist_rpm[i] = g_dtec.hist_rpm[i + 1];
+                g_dtec.hist_tps[i] = g_dtec.hist_tps[i + 1];
             }
-        } else {
-            if ((frame++ % 10) == 0) {
-                ui_render_top();
-            }
+            g_dtec.hist_boost[GRAPH_HISTORY_LEN - 1] = g_dtec.boost_kpa;
+            g_dtec.hist_rpm[GRAPH_HISTORY_LEN - 1] = g_dtec.rpm;
+            g_dtec.hist_tps[GRAPH_HISTORY_LEN - 1] = g_dtec.tps_pct;
+            if (g_dtec.hist_count < GRAPH_HISTORY_LEN) g_dtec.hist_count++;
         }
 
-        gfxFlushBuffers();
-        gfxSwapBuffers();
-        gspWaitForVBlank();
+        bool hud_black = g_dtec.screen_mode >= DTEC_MODE_DIGITAL_SPEED &&
+                         g_dtec.screen_mode <= DTEC_MODE_BEAMNG_STYLE;
+
+        gfx3ds_begin_frame();
+        C3D_FrameBegin(C3D_FRAME_SYNCDRAW);
+
+        C2D_TargetClear(target_top, hud_black ? CLR_BLACK : CLR_BG);
+        C2D_SceneBegin(target_top);
+        dtec_3ds_render_top();
+
+        C2D_TargetClear(target_bottom, CLR_BG);
+        C2D_SceneBegin(target_bottom);
+        dtec_3ds_render_bottom();
+
+        C3D_FrameEnd(0);
+        service_link();
     }
 
-    net_cleanup();
+    if (g_dtec.logging) {
+        dtec_logger_toggle();
+    }
+    dtec_net_cleanup();
+    dtec_audio_shutdown();
+
+    gfx3ds_fini();
+    C2D_Fini();
+    C3D_Fini();
     gfxExit();
     return 0;
 }

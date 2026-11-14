@@ -17,7 +17,7 @@ static const char *const s_init_cmds[] = {
     "ATH0",  // Headers off
     "ATSP0", // Automatic protocol detection
     "ATRV",  // Battery voltage
-    "0100"   // Supported PIDs 01-20
+    "0100", "0120", "0140", "0160", "0180", "01A0", "0133"
 };
 #define ELM_INIT_COUNT ((int)(sizeof(s_init_cmds) / sizeof(s_init_cmds[0])))
 
@@ -38,6 +38,9 @@ void elm_init(ElmCore *e, const ElmCallbacks *cb,
 
 void elm_on_connected(ElmCore *e, uint32_t now_ms) {
     memset(&e->d, 0, sizeof(e->d));
+    memset(&e->diagnostics, 0, sizeof(e->diagnostics));
+    e->scanning = e->clearing = false;
+    e->response_len = 0; e->response_overflow = false;
     e->line_pos = 0;
     e->q_head = 0;
     e->q_count = 0;
@@ -56,6 +59,7 @@ void elm_on_connected(ElmCore *e, uint32_t now_ms) {
 
 void elm_on_disconnected(ElmCore *e) {
     e->connected = false;
+    e->scanning = e->clearing = false;
     e->busy = false;
     e->q_count = 0;
     e->line_pos = 0;
@@ -75,6 +79,7 @@ static void send_now(ElmCore *e, const char *cmd, uint32_t now_ms) {
         return;
     }
 
+    e->response_len = 0; e->response_overflow = false;
     snprintf(e->inflight, sizeof(e->inflight), "%s", cmd);
     e->busy = true;
     e->sent_ms = now_ms;
@@ -102,8 +107,7 @@ static bool read_hex(const char *s, int n, uint32_t *out) {
 }
 
 bool elm_pid_supported(const ElmCore *e, uint8_t pid) {
-    if (pid == 0x00 || pid > 0x20 || !e->d.has_supported) return true;
-    return (e->d.supported_01_20 & (1u << (32 - pid))) != 0;
+    return obd_supported(&e->diagnostics, pid);
 }
 
 static bool poll_cmd_supported(const ElmCore *e, const char *cmd) {
@@ -219,6 +223,10 @@ void elm_feed(ElmCore *e, const uint8_t *data, size_t len, uint32_t now_ms) {
 
     for (size_t i = 0; i < len; i++) {
         uint8_t ch = data[i];
+        if (ch != '>') {
+            if (e->response_len + 1 < sizeof(e->response)) e->response[e->response_len++] = ch;
+            else e->response_overflow = true;
+        }
 
         if (ch == '\r' || ch == '\n' || ch == '>') {
             if (e->line_pos > 0) {
@@ -227,6 +235,18 @@ void elm_feed(ElmCore *e, const uint8_t *data, size_t len, uint32_t now_ms) {
                 parse_line(e, e->line, now_ms);
             }
             if (ch == '>') {
+                e->response[e->response_len] = 0;
+                if (!e->response_overflow) obd_response(&e->diagnostics, e->inflight, e->response);
+                else e->diagnostics.scan_error = true;
+                if (e->clearing && !strcmp(e->inflight, "04")) {
+                    e->clearing = false;
+                    if (!e->diagnostics.clear_ok) {
+                        e->scanning = false;
+                        e->diagnostics.scan_error = true;
+                        elm_log(e, "Clear not acknowledged; rescan required");
+                    }
+                }
+                e->response_len = 0;
                 // Prompt: the adapter has finished and is ready for the next command.
                 e->busy = false;
                 e->inflight[0] = '\0';
@@ -249,18 +269,32 @@ void elm_tick(ElmCore *e, uint32_t now_ms) {
             snprintf(msg, sizeof(msg), "No reply to %s (timeout)", e->inflight);
             elm_log(e, msg);
             e->d.timeouts++;
+            if (e->scanning) e->diagnostics.scan_error = true;
+            if (e->clearing) { e->clearing = e->scanning = false; elm_log(e, "Clear timed out; rescan required"); }
         }
         e->busy = false;
         e->inflight[0] = '\0';
     }
 
-    if (e->init_idx < ELM_INIT_COUNT) {
+    while (e->init_idx < ELM_INIT_COUNT) {
         int idx = e->init_idx++;
+        if (!poll_cmd_supported(e, s_init_cmds[idx])) continue;
         send_now(e, s_init_cmds[idx], now_ms);
         if (e->inflight[0] == '\0') e->init_idx = idx; // send failed, retry it
         return;
     }
 
+    if (e->scanning) {
+        if (e->clearing) { send_now(e, "04", now_ms); return; }
+        const char *cmd;
+        while ((cmd = obd_scan_job(&e->diagnostics, e->scan_index)) != NULL) {
+            if (!cmd[0]) { e->scan_index++; continue; }
+            send_now(e, cmd, now_ms);
+            if (e->inflight[0]) e->scan_index++;
+            return;
+        }
+        e->scanning = false;
+    }
     if (e->q_count > 0) {
         char cmd[ELM_CMD_MAX];
         snprintf(cmd, sizeof(cmd), "%s", e->queue[e->q_head]);
@@ -302,5 +336,12 @@ bool elm_request(ElmCore *e, const char *cmd) {
     int slot = (e->q_head + e->q_count) % ELM_QUEUE_LEN;
     snprintf(e->queue[slot], ELM_CMD_MAX, "%s", cmd);
     e->q_count++;
+    return true;
+}
+
+bool elm_scan(ElmCore *e, bool clear_first) {
+    if (!e->connected || e->scanning) return false;
+    obd_scan_reset(&e->diagnostics);
+    e->scan_index = 0; e->scanning = true; e->clearing = clear_first;
     return true;
 }

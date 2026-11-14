@@ -18,20 +18,22 @@ include $(DEVKITARM)/3ds_rules
 
 TARGET          := dsobd
 BUILD           := build
-SOURCES         := source ../core/source
+SOURCES         := source
+SHARED_SOURCES  := ../source
+SHARED_CFILES   := dtec_obd.c dtec_settings.c dtec_logger.c ini.c
 DATA            := data
-INCLUDES        := include ../core/include $(CTRULIB)/include
+INCLUDES        := include ../include ../core/include $(CTRULIB)/include
 
-APP_TITLE       := DSOBD 3DS Terminal
-APP_DESCRIPTION := Veepeak OBDCheck VP01 WiFi Terminal
-APP_AUTHOR      := DSOBD
+APP_TITLE       := 3DSOBD
+APP_DESCRIPTION := Nintendo 3DS OBD-II Digital Cluster
+APP_AUTHOR      := 3DSOBD
 export APP_ICON := $(TOPDIR)/icon.png
 
 ARCH            := -march=armv6k -mtune=mpcore -mfloat-abi=hard -mtp=soft
 
 CFLAGS          := -g -Wall -O2 -mword-relocations \
                    -ffunction-sections \
-                   $(ARCH) -D__3DS__
+                   $(ARCH) -D__3DS__ -DDTEC_BRAND_NAME=\"3DSOBD\"
 
 CFLAGS          += $(INCLUDE)
 
@@ -40,7 +42,7 @@ CXXFLAGS        := $(CFLAGS) -fno-rtti -fno-exceptions -std=gnu++11
 ASFLAGS         := -g $(ARCH)
 LDFLAGS         = -specs=3dsx.specs -g $(ARCH) -Wl,-Map,$(notdir $*.map)
 
-LIBS            := -lctru -lm
+LIBS            := -lcitro2d -lcitro3d -lctru -lm
 LIBDIRS         := $(CTRULIB)
 
 ifneq ($(BUILD),$(notdir $(CURDIR)))
@@ -48,12 +50,12 @@ ifneq ($(BUILD),$(notdir $(CURDIR)))
 export OUTPUT   := $(CURDIR)/$(TARGET)
 export TOPDIR   := $(CURDIR)
 
-export VPATH    := $(foreach dir,$(SOURCES),$(CURDIR)/$(dir)) \
+export VPATH    := $(foreach dir,$(SOURCES) $(SHARED_SOURCES),$(CURDIR)/$(dir)) \
                    $(foreach dir,$(DATA),$(CURDIR)/$(dir))
 
 export DEPSDIR  := $(CURDIR)/$(BUILD)
 
-CFILES          := $(foreach dir,$(SOURCES),$(notdir $(wildcard $(dir)/*.c)))
+CFILES          := $(foreach dir,$(SOURCES),$(notdir $(wildcard $(dir)/*.c))) $(SHARED_CFILES)
 CPPFILES        := $(foreach dir,$(SOURCES),$(notdir $(wildcard $(dir)/*.cpp)))
 SFILES          := $(foreach dir,$(SOURCES),$(notdir $(wildcard $(dir)/*.s)))
 BINFILES        := $(foreach dir,$(DATA),$(notdir $(wildcard $(dir)/*.*)))
@@ -107,6 +109,18 @@ $(OUTPUT).3dsx : $(OUTPUT).elf $(_3DSXDEPS)
 $(OFILES_SOURCES) : $(HFILES)
 
 $(OUTPUT).elf : $(OFILES)
+
+%.t3x.o : %.t3x
+	$(SILENTMSG) $(notdir $<)
+	$(bin2o)
+
+%.bcfnt.o : %.bcfnt
+	$(SILENTMSG) $(notdir $<)
+	$(bin2o)
+
+ini.o : $(TOPDIR)/../core/source/ini.c
+	$(SILENTMSG) $(notdir $<)
+	$(SILENTCMD)$(CC) -MMD -MP -MF $(DEPSDIR)/$*.d $(CFLAGS) -c $< -o $@
 
 -include $(DEPSDIR)/*.d
 

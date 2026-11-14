@@ -2,170 +2,164 @@
 #include <stdio.h>
 #include <string.h>
 
-#include "common.h"
-#include "config.h"
-#include "net.h"
-#include "obd.h"
-#include "ui.h"
+#include "dtec_common.h"
+#include "dtec_gfx.h"
+#include "dtec_net.h"
+#include "dtec_obd.h"
+#include "dtec_audio.h"
+#include "dtec_settings.h"
+#include "dtec_logger.h"
 
-AppState g_state;
+DTEC_State g_dtec;
 
-static void state_init(void) {
-    memset(&g_state, 0, sizeof(g_state));
-    g_state.dsi_mode = isDSiMode();
-    g_state.ui_mode = UI_MODE_TERMINAL;
-    g_state.net_status = NET_STATUS_DISCONNECTED;
-    strncpy(g_state.status_msg, "Initializing...", sizeof(g_state.status_msg) - 1);
-    strncpy(g_state.wifi_ssid, DEFAULT_OBD_SSID, sizeof(g_state.wifi_ssid) - 1);
-    strncpy(g_state.target_ip, DEFAULT_OBD_IP, sizeof(g_state.target_ip) - 1);
-    g_state.target_port = DEFAULT_OBD_PORT;
-    g_state.coolant_temp_c = -999;
+static volatile uint32_t s_millis;
+
+static void clock_tick(void) {
+    s_millis += 10;
+}
+
+// Forward declarations
+void dtec_render_top(uint16_t *buf);
+void dtec_render_bottom(uint16_t *buf);
+void dtec_handle_touch(int tx, int ty, bool is_down);
+void dtec_handle_keys(uint32_t keys);
+
+// Offscreen Backbuffers for 100% flicker-free 60 FPS rendering
+static uint16_t s_top_backbuffer[SCREEN_W * SCREEN_H];
+static uint16_t s_bottom_backbuffer[SCREEN_W * SCREEN_H];
+
+// DMA reads RAM, not the ARM9 data cache: flush first or real hardware shows stale RAM (white on R4).
+static void present(uint16_t *vram_top, uint16_t *vram_bottom) {
+    DC_FlushRange(s_top_backbuffer, sizeof(s_top_backbuffer));
+    DC_FlushRange(s_bottom_backbuffer, sizeof(s_bottom_backbuffer));
+    dmaCopyWords(3, s_top_backbuffer, vram_top, sizeof(s_top_backbuffer));
+    dmaCopyWords(3, s_bottom_backbuffer, vram_bottom, sizeof(s_bottom_backbuffer));
+}
+
+#ifdef BOOT_TRACE
+// Diagnostic build only: one solid colour per boot stage, so a hang on real hardware names its stage.
+#ifndef BOOT_TRACE_FRAMES
+#define BOOT_TRACE_FRAMES 60
+#endif
+#ifndef BOOT_TRACE_STAGES
+#define BOOT_TRACE_STAGES 4
+#endif
+static void boot_mark(uint16_t *top, uint16_t *bottom, uint16_t color, int stage) {
+    if (stage > BOOT_TRACE_STAGES) return;
+    uint32_t fill = (uint32_t)(color | 0x8000) * 0x10001u;
+    dmaFillWords(fill, top, 256 * 192 * 2);
+    dmaFillWords(fill, bottom, 256 * 192 * 2);
+    // ~1 s by polling the scanline counter: must not depend on IRQs, which may be what is broken.
+    for (int i = 0; i < BOOT_TRACE_FRAMES; i++) { while (REG_VCOUNT != 192); while (REG_VCOUNT == 192); }
+}
+#else
+#define boot_mark(top, bottom, color, stage) ((void)0)
+#endif
+
+// Live Wi-Fi/socket processing plus the next OBD request once the adapter is ready.
+static void service_link(void) {
+    dtec_net_update();
+    dtec_audio_update();
+    // Use elapsed time even when rendering runs slower than 60 FPS.
+    if (g_dtec.screen_mode != DTEC_MODE_CAR_SELECT) {
+        dtec_obd_poll_tick(s_millis);
+    }
 }
 
 int main(void) {
-    // 1. Boost CPU clock if running on DSi (134 MHz TWL mode)
     if (isDSiMode()) {
         setCpuClock(true);
     }
 
-    // 2. Initialize application state & load config
-    state_init();
-    config_load();
+    // 1. Configure screens: Top is main 2D engine, Bottom is sub 2D engine
+    lcdMainOnTop();
 
-    snprintf(g_state.wifi_ssid, sizeof(g_state.wifi_ssid), "%s", g_config.wifi_ssid);
-    snprintf(g_state.target_ip, sizeof(g_state.target_ip), "%s", g_config.obd_ip);
-    g_state.target_port = g_config.obd_port;
+    videoSetMode(MODE_5_2D);
+    videoSetModeSub(MODE_5_2D);
 
-    // 3. Initialize dual-screen text consoles
-    ui_init();
+    // Bank A (128 KB) -> Top Screen Bitmap
+    vramSetBankA(VRAM_A_MAIN_BG);
+    int bg_top = bgInit(3, BgType_Bmp16, BgSize_B16_256x256, 0, 0);
+    uint16_t *vram_top = bgGetGfxPtr(bg_top);
 
-    // 4. Initialize OBD protocol engine
-    obd_init();
+    // Bank C (128 KB) -> Bottom Touch Screen Bitmap
+    vramSetBankC(VRAM_C_SUB_BG);
+    int bg_sub = bgInitSub(3, BgType_Bmp16, BgSize_B16_256x256, 0, 0);
+    uint16_t *vram_bottom = bgGetGfxPtr(bg_sub);
 
-    // 5. Initialize DSWifi and start AP association
-    net_init();
+    // Set hardware backdrop colors to cockpit dark blue
+    BG_PALETTE[0] = DTEC_COLOR_BG;
+    BG_PALETTE_SUB[0] = DTEC_COLOR_BG;
 
-    uint32_t frame = 0;
+    // Clear hardware VRAM using 32-bit DMA word fills
+    dmaFillWords((uint32_t)DTEC_COLOR_BG | ((uint32_t)DTEC_COLOR_BG << 16), vram_top, 256 * 192 * 2);
+    dmaFillWords((uint32_t)DTEC_COLOR_BG | ((uint32_t)DTEC_COLOR_BG << 16), vram_bottom, 256 * 192 * 2);
+
+    // 3. Initialize OBD engine and Wi-Fi
+    memset(&g_dtec, 0, sizeof(g_dtec));
+    g_dtec.screen_mode = DTEC_MODE_MULTI_GAUGE;
+    boot_mark(vram_top, vram_bottom, RGB15(31, 0, 0), 1);   // red: main() reached
+    timerStart(0, ClockDivider_1024, TIMER_FREQ_1024(100), clock_tick);
+    dtec_obd_init();
+    dtec_settings_init();
+    boot_mark(vram_top, vram_bottom, RGB15(31, 31, 0), 2);  // yellow: SD card init returned
+    dtec_audio_init();
+    boot_mark(vram_top, vram_bottom, RGB15(0, 31, 0), 3);   // green: audio init returned
+    dtec_net_init();
+    boot_mark(vram_top, vram_bottom, RGB15(0, 0, 31), 4);   // blue: Wi-Fi init returned
+
     touchPosition touch;
+    bool was_touching = false;
+    uint32_t frame = 0;
 
-    // 6. Main loop
+    // 4. Main Event & Render Loop (60 FPS driven by VBlank)
     while (1) {
+        // Yield to dswifi/lwIP cooperative threads until next VBlank IRQ
         cothread_yield_irq(IRQ_VBLANK);
 
+        // Copy completed backbuffers into hardware VRAM during VBlank
+        present(vram_top, vram_bottom);
+
+        // Scan keys & touch
         scanKeys();
         uint32_t k_down = keysDown();
+        uint32_t k_held = keysHeld();
 
-        if (g_state.ui_mode == UI_MODE_WIFI_SCAN) {
-            // =========================================================
-            // Wi-Fi Scanner / AP Selector Input Handling
-            // =========================================================
-            if (k_down & KEY_UP) {
-                if (g_state.scan_selected_idx > 0) {
-                    g_state.scan_selected_idx--;
-                }
-            }
-            if (k_down & KEY_DOWN) {
-                if (g_state.scan_selected_idx + 1 < g_state.scan_ap_count) {
-                    g_state.scan_selected_idx++;
-                }
-            }
-            if (k_down & KEY_A) {
-                net_connect_to_ap_index(g_state.scan_selected_idx);
-            }
-            if (k_down & KEY_B) {
-                net_stop_scan();
-                ui_clear_log();
-                ui_log_system("Wi-Fi selection cancelled");
-            }
-            if (k_down & KEY_X) {
-                net_start_scan();
-            }
-
-            // Touch screen AP list selection
-            if (k_down & KEY_TOUCH) {
-                touchRead(&touch);
-                int row = touch.py / 8; // 8x8 character rows (0-23)
-
-                // Rows 2-18 correspond to the visible AP list
-                if (row >= 2 && row <= 18) {
-                    int clicked_idx = g_state.scan_scroll_offset + (row - 2);
-                    if (clicked_idx >= 0 && clicked_idx < g_state.scan_ap_count) {
-                        if (clicked_idx == g_state.scan_selected_idx) {
-                            // Tapping already-selected item connects immediately
-                            net_connect_to_ap_index(clicked_idx);
-                        } else {
-                            // First tap selects item
-                            g_state.scan_selected_idx = clicked_idx;
-                        }
-                    }
-                } else if (row == 21) {
-                    // Tap on "[A / Tap] Connect to AP" row
-                    net_connect_to_ap_index(g_state.scan_selected_idx);
-                } else if (row == 22) {
-                    // Tap on "[X] Rescan"
-                    net_start_scan();
-                } else if (row == 23) {
-                    // Tap on "[B] Cancel"
-                    net_stop_scan();
-                    ui_clear_log();
-                    ui_log_system("Wi-Fi selection cancelled");
-                }
-            }
-        } else {
-            // =========================================================
-            // Standard Live Terminal Mode Input Handling
-            // =========================================================
-            if (k_down & KEY_A) {
-                obd_send_cmd("ATZ");
-            }
-            if (k_down & KEY_B) {
-                obd_send_cmd("010C");
-            }
-            if (k_down & KEY_X) {
-                obd_send_cmd("010D");
-            }
-            if (k_down & KEY_Y) {
-                obd_send_cmd("ATRV");
-            }
-            if (k_down & KEY_L) {
-                obd_send_cmd("0105");
-            }
-            if (k_down & KEY_R) {
-                obd_send_cmd("0100");
-            }
-            if (k_down & KEY_START) {
-                g_state.auto_poll = !g_state.auto_poll;
-                ui_log_system(g_state.auto_poll ? "Auto-Polling: ENABLED" : "Auto-Polling: DISABLED");
-            }
-            if (k_down & KEY_SELECT) {
-                // Enter Wi-Fi Network Scanner / AP Selector
-                net_start_scan();
-            }
-            if (k_down & KEY_UP) {
-                ui_clear_log();
-            }
+        // Touch Input
+        if (k_held & KEY_TOUCH) {
+            touchRead(&touch);
+            if (!was_touching) dtec_handle_touch(touch.px, touch.py, true);
+            was_touching = true;
+        } else if (was_touching) {
+            was_touching = false;
         }
 
-        // Network and beacon scan updates
-        net_update();
+        dtec_handle_keys(k_down);
 
-        // OBD auto-query polling
-        if (g_state.ui_mode == UI_MODE_TERMINAL) {
-            obd_poll_tick();
+        service_link();
+        dtec_logger_tick(s_millis);
+
+        // Update real rolling telemetry history every 10 frames (~6 Hz)
+        if ((frame++ % 10) == 0) {
+            for (int i = 0; i < GRAPH_HISTORY_LEN - 1; i++) {
+                g_dtec.hist_boost[i] = g_dtec.hist_boost[i + 1];
+                g_dtec.hist_rpm[i] = g_dtec.hist_rpm[i + 1];
+                g_dtec.hist_tps[i] = g_dtec.hist_tps[i + 1];
+            }
+            g_dtec.hist_boost[GRAPH_HISTORY_LEN - 1] = g_dtec.boost_kpa;
+            g_dtec.hist_rpm[GRAPH_HISTORY_LEN - 1] = g_dtec.rpm;
+            g_dtec.hist_tps[GRAPH_HISTORY_LEN - 1] = g_dtec.tps_pct;
+            if (g_dtec.hist_count < GRAPH_HISTORY_LEN) g_dtec.hist_count++;
         }
 
-        // Screen rendering
-        if (g_state.ui_mode == UI_MODE_WIFI_SCAN) {
-            // Render Wi-Fi scanner every 4 frames (15 Hz) for fast responsive navigation
-            if ((frame++ % 4) == 0) {
-                ui_render_top();
-                ui_render_bottom();
-            }
-        } else {
-            // Refresh top dashboard every 10 frames (~6 Hz)
-            if ((frame++ % 10) == 0) {
-                ui_render_top();
-            }
+        // Service the socket between renders too, so a reply that lands mid-frame
+        // triggers the next request right away instead of waiting for VBlank.
+        dtec_render_top(s_top_backbuffer);
+        service_link();
+        // The bottom screen is status/touch UI; 15 FPS frees CPU for the gauges.
+        if ((frame & 3) == 1) {
+            dtec_render_bottom(s_bottom_backbuffer);
+            service_link();
         }
     }
 

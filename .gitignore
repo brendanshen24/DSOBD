@@ -16,5 +16,7 @@ PARAM.SFO
 # macOS
 .DS_Store
 
-# Reference media for the gauge UI (~60 MB of frames and videos, kept locally)
-turboxs-dtec/reference_images/
+/macos_app/.build/
+/macos_app/.swiftpm/
+*.app/
+/.idea/

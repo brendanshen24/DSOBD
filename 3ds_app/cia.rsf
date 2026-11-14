@@ -1,5 +1,5 @@
 BasicInfo:
-  Title                   : "DSOBD 3DS Terminal"
+  Title                   : "3DSOBD"
   CompanyCode             : "00"
   ProductCode             : "CTR-P-DOBD"
   ContentType             : Application
@@ -40,6 +40,7 @@ AccessControlInfo:
    - "ac:u"
    - "ac:i"
    - "cfg:u"
+   - "dsp::DSP"
    - "fs:USER"
    - "gsp::Gpu"
    - "hid:USER"

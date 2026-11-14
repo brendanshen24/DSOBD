@@ -9,7 +9,7 @@ GAME_AUTHOR := DSOBD
 ARM7ELF := $(BLOCKSDS)/sys/arm7/main_core/arm7_dswifi.elf
 LIBS := -ldswifi9 -lnds9 -lm
 LIBDIRS := $(BLOCKSDS)/libs/dswifi $(BLOCKSDS)/libs/libnds
-INCLUDEDIRS := include $(BLOCKSDS)/libs/dswifi/include $(BLOCKSDS)/libs/libnds/include core/include
-SOURCEDIRS := source core/source
+INCLUDEDIRS := terminal_app/include $(BLOCKSDS)/libs/dswifi/include $(BLOCKSDS)/libs/libnds/include core/include
+SOURCEDIRS := terminal_app/source core/source
 
 include $(BLOCKSDS)/sys/default_makefiles/rom_arm9/Makefile

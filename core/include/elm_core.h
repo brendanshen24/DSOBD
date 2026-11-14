@@ -1,14 +1,15 @@
 #ifndef ELM_CORE_H
 #define ELM_CORE_H
 
-// Shared, platform-independent ELM327 protocol engine used by every DSOBD app
-// (DS terminal, 3DS, PSP and the turboxs-dtec gauge cluster).
+// ELM327 scheduler for the DS terminal, 3DS and PSP. The diagnostics
+// parser in obd_diag.h is also used by the native macOS engine.
 //
 // The ELM327 only handles one command at a time: if it receives a character
 // while still working on a command it aborts and replies "STOPPED". This core
 // therefore never sends a command until the previous one has been answered with
 // the '>' prompt (or has timed out).
 
+#include "obd_diag.h"
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -67,6 +68,11 @@ typedef struct {
 typedef struct {
     ElmCallbacks cb;
     ElmData d;
+    ObdDiagnostics diagnostics;
+    char response[4096];
+    size_t response_len;
+    bool response_overflow, scanning, clearing;
+    int scan_index;
 
     char line[128];
     size_t line_pos;
@@ -104,13 +110,15 @@ void elm_feed(ElmCore *e, const uint8_t *data, size_t len, uint32_t now_ms);
 
 // Call every frame. Sends the next queued, init or poll command when the
 // adapter is idle, and handles reply timeouts.
+bool elm_scan(ElmCore *e, bool clear_first);
+
 void elm_tick(ElmCore *e, uint32_t now_ms);
 
 // Queue a manual command. Returns false if not connected or the queue is full.
 bool elm_request(ElmCore *e, const char *cmd);
 
 // True if the vehicle reported the given mode 01 PID as supported, or if
-// support is unknown (no 0100 answer yet, or a PID outside 01-20).
+// support is unknown. Handles supported-PID ranges through 01A0.
 bool elm_pid_supported(const ElmCore *e, uint8_t pid);
 
 #endif // ELM_CORE_H

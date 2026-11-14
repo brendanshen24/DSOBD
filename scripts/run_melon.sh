@@ -47,6 +47,6 @@ nohup "$MELONDS_APP/Contents/MacOS/melonDS" "$ROM_PATH" >/tmp/melonds_dsobd.log 
 disown
 
 echo -e "\n${GREEN}${BOLD}✓ melonDS launched with dsobd.nds!${RESET}\n"
-echo -e "${CYAN}DS Controls (dtec gauges):${RESET}"
+echo -e "${CYAN}DS Controls (gauges):${RESET}"
 echo -e "  • ${BOLD}[SELECT]${RESET} Next display mode   • ${BOLD}[START]${RESET} Toggle auto-poll"
 echo -e "  • ${BOLD}[A]${RESET} ATRV  ${BOLD}[B]${RESET} 010C  ${BOLD}[X]${RESET} 010D  ${BOLD}[Y]${RESET} 010B  ${BOLD}[L]${RESET} 0105  ${BOLD}[R]${RESET} 0104"
